@@ -278,7 +278,12 @@ label.f input {
 .link:hover { color: var(--text); }
 .sync-form { display: flex; flex-direction: column; gap: 8px; }
 .sync-form[hidden] { display: none; }
-.btn[hidden] { display: none; }
+[hidden] { display: none !important; }
+#sealText {
+  width: 100%; resize: none; padding: 8px 10px; border-radius: 9px; border: 1px solid var(--line);
+  background: var(--bg); font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; word-break: break-all;
+}
+#sealCopy { align-self: flex-start; }
 
 /* ---------- Mobile ---------- */
 @media (max-width: 700px) {
@@ -388,9 +393,15 @@ label.f input {
     <h2>Sincronización</h2>
     <p class="muted" id="syncStatus"></p>
     <form class="sync-form" id="syncForm">
-      <label class="f">Token de GitHub<input type="password" id="sToken" autocomplete="off" spellcheck="false" required></label>
+      <label class="f" id="tokenField">Token de GitHub<input type="password" id="sToken" autocomplete="off" spellcheck="false"></label>
+      <label class="f" id="pwField"><span id="pwLbl">Contraseña</span><input type="password" id="sPw" autocomplete="off" spellcheck="false"></label>
       <a class="link" id="tokenLink" target="_blank" rel="noopener">Crear token</a>
     </form>
+    <div class="sync-form" id="sealOut" hidden>
+      <span class="muted">Código cifrado para los demás dispositivos:</span>
+      <textarea id="sealText" readonly rows="4"></textarea>
+      <button type="button" class="btn" id="sealCopy">Copiar</button>
+    </div>
     <div class="actions">
       <button type="button" class="btn danger" id="sOff">Desconectar</button>
       <span class="sp"></span>
@@ -400,10 +411,13 @@ label.f input {
   </div>
 </dialog>
 
+<script src="config.js"></script>
 <script>
 (() => {
   const KEY = 'agenda-v1', VIEW_KEY = 'agenda-v1-view', SYNC_KEY = 'agenda-sync';
   const DATA_REPO = 'renatozepi/agenda-datos';
+  // Token cifrado con la contraseña del usuario (AES-GCM + PBKDF2). Vacío = pedir el token.
+  const ENC_TOKEN = window.AGENDA_ENC_TOKEN || '';
   const POLL_MS = 20000;
 
   const $ = s => document.querySelector(s);
@@ -942,20 +956,66 @@ label.f input {
     document.addEventListener('visibilitychange', () => { if (!document.hidden) run(); });
     window.addEventListener('online', () => run());
     setStatus(status);
-    return { run, schedule, connect, disconnect, paint, on, repo };
+    return { run, schedule, connect, disconnect, paint, on, repo, fail: msg => setStatus('error', msg) };
   })();
+
+  // ---------- Token cifrado ----------
+  const b64u = u8 => { let s = ''; u8.forEach(c => s += String.fromCharCode(c)); return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, ''); };
+  const unb64u = s => Uint8Array.from(atob(s.replace(/-/g, '+').replace(/_/g, '/')), c => c.charCodeAt(0));
+  async function deriveKey(pw, salt) {
+    const base = await crypto.subtle.importKey('raw', new TextEncoder().encode(pw), 'PBKDF2', false, ['deriveKey']);
+    return crypto.subtle.deriveKey({ name: 'PBKDF2', salt, iterations: 250000, hash: 'SHA-256' }, base, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+  }
+  async function sealToken(token, pw) {
+    const salt = crypto.getRandomValues(new Uint8Array(16)), iv = crypto.getRandomValues(new Uint8Array(12));
+    const ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, await deriveKey(pw, salt), new TextEncoder().encode(token)));
+    return ['v1', b64u(salt), b64u(iv), b64u(ct)].join('.');
+  }
+  async function openToken(sealed, pw) {
+    const [, s, i, c] = sealed.split('.');
+    const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: unb64u(i) }, await deriveKey(pw, unb64u(s)), unb64u(c));
+    return new TextDecoder().decode(pt);
+  }
+  if (ENC_TOKEN) {
+    $('#tokenField').hidden = true; $('#tokenLink').hidden = true;
+    $('#sPw').required = true;
+  } else {
+    $('#sToken').required = true;
+    $('#pwLbl').textContent = 'Contraseña para otros dispositivos (opcional)';
+  }
 
   const owner = Sync.repo().split('/')[0];
   $('#tokenLink').href = 'https://github.com/settings/personal-access-tokens/new?name=Agenda&description=Sincronizar%20la%20agenda&target_name='
     + encodeURIComponent(owner) + '&expires_in=none&contents=write';
-  $('#btnSync').onclick = () => { Sync.paint(); syncDlg.showModal(); };
+  $('#btnSync').onclick = () => { $('#sealOut').hidden = true; Sync.paint(); syncDlg.showModal(); if (ENC_TOKEN && !Sync.on()) $('#sPw').focus(); };
   $('#sClose').onclick = () => syncDlg.close();
   $('#sOff').onclick = () => { Sync.disconnect(); Sync.paint(); };
-  $('#sGo').onclick = () => {
+  $('#sGo').onclick = async () => {
     if (Sync.on()) { Sync.run(); return; }
     const f = $('#syncForm');
     if (!f.reportValidity()) return;
-    Sync.connect($('#sToken').value);
+    const pw = $('#sPw').value;
+    if (ENC_TOKEN) {
+      let token;
+      try { token = await openToken(ENC_TOKEN, pw); }
+      catch (e) { Sync.fail('Contraseña incorrecta.'); return; }
+      $('#sPw').value = '';
+      await Sync.connect(token);
+      return;
+    }
+    const token = $('#sToken').value.trim();
+    await Sync.connect(token);
+    $('#sPw').value = '';
+    if (Sync.on() && pw) {
+      $('#sealText').value = await sealToken(token, pw);
+      $('#sealOut').hidden = false;
+    }
+  };
+  $('#sealCopy').onclick = async () => {
+    const t = $('#sealText');
+    try { await navigator.clipboard.writeText(t.value); } catch (e) { t.select(); document.execCommand('copy'); }
+    $('#sealCopy').textContent = 'Copiado';
+    setTimeout(() => { $('#sealCopy').textContent = 'Copiar'; }, 1500);
   };
   $('#syncForm').addEventListener('submit', e => { e.preventDefault(); $('#sGo').click(); });
 
